@@ -5,3 +5,4 @@ yfinance
 matplotlib
 seaborn
 requests
+curl_cffi
