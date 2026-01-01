@@ -5,37 +5,84 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
 import requests
+from datetime import datetime
 
-# --- YOUR EXISTING LOGIC (UNTOUCHED) ---
+# --- INTEGRATED HELPER FUNCTIONS ---
 
 def get_market_data(symbol, start, end):
-    df = yf.download(symbol, start=start, end=end)
+    """Fetches stock price and historical daily volatility with browser headers."""
+    # Use a session with headers to avoid being blocked by Yahoo Finance
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
+    
+    df = yf.download(symbol, start=start, end=end, session=session, progress=False)
+    
+    if df.empty:
+        return None, None
+    
     close_prices = df['Close'].squeeze()
+    if len(close_prices) < 2:
+        return None, None
+        
     log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
     sigma_daily = float(log_returns.std())
     current_price = float(close_prices.iloc[-1])
     return current_price, sigma_daily
 
 def get_company_context(symbol):
+    """Fetches news and earnings data."""
     session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 Chrome/91.0.4472.124'})
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
     ticker = yf.Ticker(symbol, session=session)
+    
+    # Earnings
     calendar = ticker.calendar
     next_earnings = "N/A"
     if isinstance(calendar, dict):
         date_list = calendar.get('Earnings Date') or calendar.get('Earnings Date ')
         if date_list and len(date_list) > 0:
             next_earnings = date_list[0].strftime('%Y-%m-%d')
+            
+    # News Headlines
     news_data = ticker.news
-    news_list = [item.get('title') for item in news_data[:3] if item.get('title')]
+    news_list = []
+    if news_data:
+        for item in news_data[:3]:
+            title = item.get('title') or item.get('headline') or (item.get('content', {}).get('title') if 'content' in item else None)
+            if title: news_list.append(title)
+    
     return next_earnings, news_list
 
+def get_option_market_price(symbol, strike, target_expiry, option_type='call'):
+    """Fetches current Mid-Price from the exchange."""
+    ticker = yf.Ticker(symbol)
+    expirations = ticker.options
+    if not expirations: return 0.0, "N/A"
+    
+    actual_expiry = min(expirations, key=lambda d: abs(pd.to_datetime(d) - pd.to_datetime(target_expiry)))
+    opt_chain = ticker.option_chain(actual_expiry)
+    df = opt_chain.calls if option_type.lower() == 'call' else opt_chain.puts
+    
+    contract = df[df['strike'] == strike]
+    if contract.empty:
+        contract = df.iloc[(df['strike'] - strike).abs().argsort()[:1]]
+        
+    bid, ask, last = contract['bid'].values[0], contract['ask'].values[0], contract['lastPrice'].values[0]
+    mid_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+    return mid_price, actual_expiry
+
 def run_simulation(S0, K, r, T, sigma_daily, option_type='call', trials=50000):
+    """Standard Monte Carlo for Option Pricing."""
     trading_days = int(T * 252) or 1
     r_daily = r / 252
     drift_daily = r_daily - (0.5 * sigma_daily**2)
     Z = np.random.standard_normal((trading_days, trials))
     paths = S0 * np.exp(np.cumsum(drift_daily + (sigma_daily * Z), axis=0))
+    
     ST = paths[-1]
     payoffs = np.maximum(ST - K, 0) if option_type.lower() == 'call' else np.maximum(K - ST, 0)
     price = np.exp(-r * T) * np.mean(payoffs)
@@ -44,51 +91,64 @@ def run_simulation(S0, K, r, T, sigma_daily, option_type='call', trials=50000):
 # --- STREAMLIT UI ---
 
 st.set_page_config(page_title="Monte Carlo Option Pricer", layout="wide")
-st.title("📈 Monte Carlo Option Analysis")
+st.title("🛡️ Monte Carlo Option Analysis")
 
-# Sidebar for User Inputs
 with st.sidebar:
-    st.header("Simulation Parameters")
-    symbol = st.text_input("Stock Symbol", value="TWLO").upper()
-    strike = st.number_input("Strike Price ($)", value=150.0)
-    time_to_expiry = st.number_input("Time to Expiry (Years)", value=0.5, step=0.1)
-    target_expiry = st.text_input("Target Expiry (YYYY-MM-DD)", value="2026-06-18")
-    opt_type = st.selectbox("Option Type", ["Call", "Put"]).lower()
-    run_btn = st.button("Run Analysis")
+    st.header("Parameters")
+    SYMBOL = st.text_input("Ticker Symbol", value="TWLO").upper()
+    K = st.number_input("Strike Price ($)", value=150.0)
+    T_YEARS = st.number_input("Time to Expiry (Years)", value=0.5)
+    TARGET_DATE = st.text_input("Target Expiry (YYYY-MM-DD)", value="2026-06-18")
+    OPT_TYPE = st.selectbox("Option Type", ["Call", "Put"]).lower()
+    RUN = st.button("Calculate & Simulate")
 
-if run_btn:
-    with st.spinner('Fetching data and running simulation...'):
-        # 1. Fetch Data
-        S0, sigma = get_market_data(symbol, "2023-01-01", "2025-12-31")
-        earnings, news = get_company_context(symbol)
+if RUN:
+    with st.spinner(f"Analyzing {SYMBOL}..."):
+        # 1. Fetch data
+        S0, sigma = get_market_data(SYMBOL, "2023-01-01", datetime.now().strftime('%Y-%m-%d'))
         
-        # 2. Run Sim
-        model_price, paths, ST, payoffs = run_simulation(S0, strike, 0.045, time_to_expiry, sigma, opt_type)
+        if S0 is None:
+            st.error(f"Could not fetch data for {SYMBOL}. Yahoo Finance might be blocking the server or the ticker is invalid.")
+        else:
+            mkt_price, actual_exp = get_option_market_price(SYMBOL, K, TARGET_DATE, OPT_TYPE)
+            earnings, news = get_company_context(SYMBOL)
+            
+            # 2. Run Sim
+            model_price, paths, ST, payoffs = run_simulation(S0, K, 0.045, T_YEARS, sigma, OPT_TYPE)
+            
+            # 3. Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Stock Price", f"${S0:.2f}")
+            c2.metric("Market Price (Mid)", f"${mkt_price:.2f}")
+            c3.metric("Model Price", f"${model_price:.2f}")
+            c4.metric("Theoretical Edge", f"${model_price - mkt_price:.2f}")
+            
+            st.write(f"**Closest Market Expiry Found:** {actual_exp} | **Next Earnings:** {earnings}")
+            st.divider()
 
-        # 3. Metrics Display
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Current Price", f"${S0:.2f}")
-        col2.metric("Model Option Price", f"${model_price:.2f}")
-        col3.metric("Next Earnings", earnings)
+            # 4. Visualization
+            fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+            
+            # Plot 1: Paths
+            axes[0].plot(paths[:, :100], color='gray', alpha=0.1)
+            axes[0].plot(np.mean(paths, axis=1), color='blue', linewidth=2, label='Mean Path')
+            axes[0].axhline(K, color='red', linestyle='--', label='Strike')
+            axes[0].set_title("Sample Price Paths (100)")
+            axes[0].legend()
+            
+            # Plot 2: Histogram
+            sns.histplot(ST, bins=50, kde=True, ax=axes[1], color='skyblue')
+            axes[1].axvline(K, color='red', linestyle='--')
+            prob_itm = np.mean(ST > K) if OPT_TYPE == 'call' else np.mean(ST < K)
+            axes[1].set_title(f"Terminal Price Dist\nProb(ITM): {prob_itm:.1%}")
+            
+            # Plot 3: Payoff
+            axes[2].scatter(ST, payoffs, alpha=0.3, s=1, color='purple')
+            axes[2].set_title("Payoff vs Terminal Price")
+            
+            st.pyplot(fig)
 
-        # 4. Visualization
-        fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-        
-        axes[0].plot(paths[:, :100], color='gray', alpha=0.2)
-        axes[0].axhline(strike, color='red', linestyle='--', label='Strike')
-        axes[0].set_title("Sample Price Paths")
-        
-        sns.histplot(ST, bins=50, kde=True, ax=axes[1], color='skyblue')
-        axes[1].axvline(strike, color='red', linestyle='--')
-        axes[1].set_title(f"Terminal Price Dist\nProb(ITM): {np.mean(ST > strike if opt_type=='call' else ST < strike):.1%}")
-        
-        axes[2].scatter(ST, payoffs, alpha=0.3, s=1, color='purple')
-        axes[2].set_title("Payoff vs Price")
-        
-        st.pyplot(fig)
-
-        # 5. News
-        if news:
-            st.subheader("Latest Headlines")
-            for h in news:
-                st.write(f"• {h}")
+            if news:
+                st.subheader("Recent Headlines")
+                for h in news:
+                    st.write(f"• {h}")
