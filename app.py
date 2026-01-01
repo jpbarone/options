@@ -4,76 +4,85 @@ import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
-import requests
 from datetime import datetime
 
 # --- INTEGRATED HELPER FUNCTIONS ---
 
 def get_market_data(symbol, start, end):
-    """Fetches stock price and historical daily volatility with browser headers."""
-    # Use a session with headers to avoid being blocked by Yahoo Finance
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    })
-    
-    df = yf.download(symbol, start=start, end=end, session=session, progress=False)
-    
-    if df.empty:
-        return None, None
-    
-    close_prices = df['Close'].squeeze()
-    if len(close_prices) < 2:
-        return None, None
+    """Fetches stock price and volatility using yfinance's built-in session handling."""
+    try:
+        # We stop passing 'session=session' here. yfinance now handles this internally.
+        df = yf.download(symbol, start=start, end=end, progress=False)
         
-    log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
-    sigma_daily = float(log_returns.std())
-    current_price = float(close_prices.iloc[-1])
-    return current_price, sigma_daily
+        if df is None or df.empty:
+            return None, None
+        
+        # Access the 'Close' column safely
+        if 'Close' in df.columns:
+            close_prices = df['Close'].squeeze()
+        else:
+            return None, None
+
+        if len(close_prices) < 2:
+            return None, None
+            
+        log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
+        sigma_daily = float(log_returns.std())
+        current_price = float(close_prices.iloc[-1])
+        return current_price, sigma_daily
+    except Exception as e:
+        st.sidebar.error(f"Data Fetch Error: {e}")
+        return None, None
 
 def get_company_context(symbol):
-    """Fetches news and earnings data."""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    })
-    ticker = yf.Ticker(symbol, session=session)
-    
-    # Earnings
-    calendar = ticker.calendar
-    next_earnings = "N/A"
-    if isinstance(calendar, dict):
-        date_list = calendar.get('Earnings Date') or calendar.get('Earnings Date ')
-        if date_list and len(date_list) > 0:
-            next_earnings = date_list[0].strftime('%Y-%m-%d')
-            
-    # News Headlines
-    news_data = ticker.news
-    news_list = []
-    if news_data:
-        for item in news_data[:3]:
-            title = item.get('title') or item.get('headline') or (item.get('content', {}).get('title') if 'content' in item else None)
-            if title: news_list.append(title)
-    
-    return next_earnings, news_list
+    """Fetches news and earnings data using internal yfinance handling."""
+    try:
+        ticker = yf.Ticker(symbol)
+        
+        # 1. Earnings
+        calendar = ticker.calendar
+        next_earnings = "N/A"
+        if isinstance(calendar, dict):
+            date_list = calendar.get('Earnings Date') or calendar.get('Earnings Date ')
+            if date_list and len(date_list) > 0:
+                next_earnings = date_list[0].strftime('%Y-%m-%d')
+                
+        # 2. News Headlines
+        news_data = ticker.news
+        news_list = []
+        if news_data:
+            for item in news_data[:3]:
+                # Yahoo news structure can vary; checking multiple keys
+                title = item.get('title') or item.get('headline')
+                if not title and 'content' in item:
+                    title = item['content'].get('title')
+                if title: 
+                    news_list.append(title)
+        
+        return next_earnings, news_list
+    except:
+        return "N/A", []
 
 def get_option_market_price(symbol, strike, target_expiry, option_type='call'):
     """Fetches current Mid-Price from the exchange."""
-    ticker = yf.Ticker(symbol)
-    expirations = ticker.options
-    if not expirations: return 0.0, "N/A"
-    
-    actual_expiry = min(expirations, key=lambda d: abs(pd.to_datetime(d) - pd.to_datetime(target_expiry)))
-    opt_chain = ticker.option_chain(actual_expiry)
-    df = opt_chain.calls if option_type.lower() == 'call' else opt_chain.puts
-    
-    contract = df[df['strike'] == strike]
-    if contract.empty:
-        contract = df.iloc[(df['strike'] - strike).abs().argsort()[:1]]
+    try:
+        ticker = yf.Ticker(symbol)
+        expirations = ticker.options
+        if not expirations: return 0.0, "N/A"
         
-    bid, ask, last = contract['bid'].values[0], contract['ask'].values[0], contract['lastPrice'].values[0]
-    mid_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
-    return mid_price, actual_expiry
+        actual_expiry = min(expirations, key=lambda d: abs(pd.to_datetime(d) - pd.to_datetime(target_expiry)))
+        opt_chain = ticker.option_chain(actual_expiry)
+        df = opt_chain.calls if option_type.lower() == 'call' else opt_chain.puts
+        
+        contract = df[df['strike'] == strike]
+        if contract.empty:
+            contract = df.iloc[(df['strike'] - strike).abs().argsort()[:1]]
+            
+        bid, ask, last = contract['bid'].values[0], contract['ask'].values[0], contract['lastPrice'].values[0]
+        mid_price = (bid + ask) / 2 if (bid > 0 and ask > 0) else last
+        return mid_price, actual_expiry
+    except:
+        return 0.0, "N/A"
 
 def run_simulation(S0, K, r, T, sigma_daily, option_type='call', trials=50000):
     """Standard Monte Carlo for Option Pricing."""
@@ -104,29 +113,29 @@ with st.sidebar:
 
 if RUN:
     with st.spinner(f"Analyzing {SYMBOL}..."):
-        # 1. Fetch data
+        # Fetching data using current date as end point
         S0, sigma = get_market_data(SYMBOL, "2023-01-01", datetime.now().strftime('%Y-%m-%d'))
         
         if S0 is None:
-            st.error(f"Could not fetch data for {SYMBOL}. Yahoo Finance might be blocking the server or the ticker is invalid.")
+            st.error(f"Could not fetch data for {SYMBOL}. The ticker might be invalid or Yahoo Finance is rate-limiting the connection.")
         else:
             mkt_price, actual_exp = get_option_market_price(SYMBOL, K, TARGET_DATE, OPT_TYPE)
             earnings, news = get_company_context(SYMBOL)
             
-            # 2. Run Sim
+            # Simulation using a fixed risk-free rate of 4.5%
             model_price, paths, ST, payoffs = run_simulation(S0, K, 0.045, T_YEARS, sigma, OPT_TYPE)
             
-            # 3. Metrics
+            # Metrics Row
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Stock Price", f"${S0:.2f}")
             c2.metric("Market Price (Mid)", f"${mkt_price:.2f}")
             c3.metric("Model Price", f"${model_price:.2f}")
             c4.metric("Theoretical Edge", f"${model_price - mkt_price:.2f}")
             
-            st.write(f"**Closest Market Expiry Found:** {actual_exp} | **Next Earnings:** {earnings}")
+            st.write(f"**Closest Expiry Found:** {actual_exp} | **Next Earnings:** {earnings}")
             st.divider()
 
-            # 4. Visualization
+            # Visualization
             fig, axes = plt.subplots(1, 3, figsize=(20, 6))
             
             # Plot 1: Paths
@@ -142,7 +151,7 @@ if RUN:
             prob_itm = np.mean(ST > K) if OPT_TYPE == 'call' else np.mean(ST < K)
             axes[1].set_title(f"Terminal Price Dist\nProb(ITM): {prob_itm:.1%}")
             
-            # Plot 3: Payoff
+            # Plot 3: Payoff vs Price
             axes[2].scatter(ST, payoffs, alpha=0.3, s=1, color='purple')
             axes[2].set_title("Payoff vs Terminal Price")
             
